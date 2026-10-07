@@ -1,425 +1,182 @@
 import boto3
 import pandas as pd
-import io
-import numpy as np
+from io import BytesIO
 
 BUCKET_NAME = "bucket-itops"
-
-SILVER_CSV = "silver/dados_consolidados.csv"
 
 s3 = boto3.client("s3")
 
 
-# ==================================================
-# LER SILVER
-# ==================================================
+# ============================================================
+# 1. LER SILVER
+# ============================================================
 
-objeto = s3.get_object(
+obj = s3.get_object(
     Bucket=BUCKET_NAME,
-    Key=SILVER_CSV
+    Key="silver/dados_consolidados.csv"
 )
 
-df = pd.read_csv(
-    io.BytesIO(objeto["Body"].read())
-)
+dados = pd.read_csv(BytesIO(obj["Body"].read()))
 
-df["timestamp"] = pd.to_datetime(
-    df["timestamp"]
-)
+dados["timestamp"] = pd.to_datetime(dados["timestamp"])
 
-df_pa = df[
-    df["tipo"] == "PA"
-].copy()
-
-df_firewall = df[
-    df["tipo"] == "Firewall"
-].copy()
+# Apenas Access Points
+aps = dados[dados["tipo"] == "PA"].copy()
 
 
-# ==================================================
-# FUNÇÃO PARA SALVAR CSV NO GOLD
-# ==================================================
+# ============================================================
+# 2. RELATÓRIO DE ZONAS MORTAS / SUBUTILIZADAS
+# ============================================================
 
-def salvar_gold(dataframe, nome):
-
-    buffer = io.StringIO()
-
-    dataframe.to_csv(
-        buffer,
-        index=False
-    )
-
-    s3.put_object(
-        Bucket=BUCKET_NAME,
-        Key=f"gold/{nome}",
-        Body=buffer.getvalue(),
-        ContentType="text/csv"
-    )
-
-    print(f"Gold criado: gold/{nome}")
-
-
-# ==================================================
-# 1. ZONAS SUBUTILIZADAS
-# ==================================================
-
-zonas = (
-    df_pa
-    .groupby("ID_antena")
+zonas_mortas = (
+    aps.groupby("ID_antena")
     .agg(
-        media_trafego_mbps=(
-            "throughput_sent_mbps",
-            "mean"
-        ),
-
-        total_trafego_bytes=(
-            "Bytes_Sent",
-            "max"
-        ),
-
-        media_conexoes=(
-            "Active_conn",
-            "mean"
-        ),
-
-        media_cpu=(
-            "CPU_Usage",
-            "mean"
-        )
+        trafego_medio_mbps=("throughput_sent_mbps", "mean"),
+        conexoes_medias=("Active_conn", "mean"),
+        cpu_media=("CPU_Usage", "mean"),
+        ram_media=("RAM_Usage", "mean")
     )
     .reset_index()
 )
 
-zonas = zonas.sort_values(
-    "media_trafego_mbps"
+# Ordena as antenas da menor para a maior utilização
+zonas_mortas = zonas_mortas.sort_values(
+    "trafego_medio_mbps"
 )
 
-zonas["ranking_trafego"] = range(
-    1,
-    len(zonas) + 1
+# Classifica as antenas com menor tráfego
+limite = zonas_mortas["trafego_medio_mbps"].quantile(0.25)
+
+zonas_mortas["classificacao"] = zonas_mortas[
+    "trafego_medio_mbps"
+].apply(
+    lambda x: "Subutilizada" if x <= limite else "Normal"
 )
 
-# Menor volume de tráfego
-zonas["subutilizada"] = (
-    zonas["ranking_trafego"]
-    <= max(
-        1,
-        int(len(zonas) * 0.25)
-    )
-)
-
-salvar_gold(
-    zonas,
-    "zonas_subutilizadas.csv"
+s3.put_object(
+    Bucket=BUCKET_NAME,
+    Key="gold/zonas_mortas.csv",
+    Body=zonas_mortas.to_csv(index=False),
+    ContentType="text/csv"
 )
 
 
-# ==================================================
-# 2. PREDIÇÃO DE SOBRECARGA
-# ==================================================
+# ============================================================
+# 3. RELATÓRIO DE PREDIÇÃO DE SOBRECARGA
+# ============================================================
+
+# Considera somente as últimas 5 horas disponíveis
+hora_final = aps["timestamp"].max()
+hora_inicial = hora_final - pd.Timedelta(hours=5)
+
+ultimas_5h = aps[
+    aps["timestamp"] >= hora_inicial
+].copy()
+
+previsao = []
 
 LIMITE_CONEXOES = 60
 
-previsoes = []
+for antena, grupo in ultimas_5h.groupby("ID_antena"):
 
+    grupo = grupo.sort_values("timestamp")
 
-for antena, grupo in df_pa.groupby(
-    "ID_antena"
-):
+    primeira = grupo.iloc[0]
+    ultima = grupo.iloc[-1]
 
-    grupo = grupo.sort_values(
-        "timestamp"
-    ).copy()
+    tempo_horas = (
+        ultima["timestamp"] - primeira["timestamp"]
+    ).total_seconds() / 3600
 
-    # Crescimento entre medições
-    grupo["crescimento_conexoes"] = (
-        grupo["Active_conn"].diff()
+    crescimento = (
+        ultima["Active_conn"] - primeira["Active_conn"]
     )
 
-    # Média das últimas 5 horas
-    crescimento_medio = (
-        grupo["crescimento_conexoes"]
-        .tail(300)
-        .mean()
-    )
-
-    atual = grupo.iloc[-1]
-
-    conexoes_atuais = (
-        atual["Active_conn"]
-    )
-
-    if (
-        crescimento_medio > 0
-        and conexoes_atuais < LIMITE_CONEXOES
-    ):
-
-        minutos = (
-            LIMITE_CONEXOES
-            - conexoes_atuais
-        ) / crescimento_medio
-
-        horario = (
-            atual["timestamp"]
-            + pd.Timedelta(
-                minutes=float(minutos)
-            )
-        )
-
+    if tempo_horas > 0:
+        crescimento_por_hora = crescimento / tempo_horas
     else:
+        crescimento_por_hora = 0
 
-        minutos = np.nan
+    conexoes_atuais = ultima["Active_conn"]
 
-        horario = pd.NaT
+    if crescimento_por_hora > 0:
+        horas_ate_limite = (
+            LIMITE_CONEXOES - conexoes_atuais
+        ) / crescimento_por_hora
 
-    previsoes.append({
+        horario_previsto = (
+            ultima["timestamp"]
+            + pd.Timedelta(hours=horas_ate_limite)
+        )
+    else:
+        horas_ate_limite = None
+        horario_previsto = None
 
+    previsao.append({
         "ID_antena": antena,
-
-        "timestamp_atual":
-            atual["timestamp"],
-
-        "conexoes_atuais":
-            conexoes_atuais,
-
-        "limite_conexoes":
-            LIMITE_CONEXOES,
-
-        "crescimento_medio_5h":
-            crescimento_medio,
-
-        "minutos_ate_limite":
-            minutos,
-
-        "horario_estimado_sobrecarga":
-            horario
+        "conexoes_atuais": conexoes_atuais,
+        "crescimento_medio_conexoes_hora": round(
+            crescimento_por_hora, 2
+        ),
+        "limite_conexoes": LIMITE_CONEXOES,
+        "horas_ate_limite": (
+            round(horas_ate_limite, 2)
+            if horas_ate_limite is not None
+            else None
+        ),
+        "horario_previsto_sobrecarga": horario_previsto
     })
 
+previsao = pd.DataFrame(previsao)
 
-previsao = pd.DataFrame(
-    previsoes
+s3.put_object(
+    Bucket=BUCKET_NAME,
+    Key="gold/previsao_sobrecarga.csv",
+    Body=previsao.to_csv(index=False),
+    ContentType="text/csv"
 )
 
-salvar_gold(
-    previsao,
-    "previsao_sobrecarga.csv"
-)
 
-
-# ==================================================
-# 3. EFICIÊNCIA DE HARDWARE
-# ==================================================
+# ============================================================
+# 4. RELATÓRIO DE EFICIÊNCIA DE HARDWARE
+# ============================================================
 
 eficiencia = (
-    df_pa
-    .groupby("ID_antena")
+    aps.groupby("ID_antena")
     .agg(
-
-        trafego_medio_mbps=(
-            "throughput_sent_mbps",
-            "mean"
-        ),
-
-        cpu_medio=(
-            "CPU_Usage",
-            "mean"
-        )
+        trafego_medio_mbps=("throughput_sent_mbps", "mean"),
+        cpu_media=("CPU_Usage", "mean")
     )
     .reset_index()
 )
 
-
-eficiencia["eficiencia"] = (
+# Evita divisão por zero
+eficiencia["eficiencia_trafego_cpu"] = (
     eficiencia["trafego_medio_mbps"]
-    /
-    eficiencia["cpu_medio"].replace(
-        0,
-        np.nan
-    )
+    / eficiencia["cpu_media"].replace(0, pd.NA)
 )
 
-
+# Maior eficiência primeiro
 eficiencia = eficiencia.sort_values(
-    "eficiencia",
+    "eficiencia_trafego_cpu",
     ascending=False
 )
 
-eficiencia["ranking"] = range(
-    1,
-    len(eficiencia) + 1
+s3.put_object(
+    Bucket=BUCKET_NAME,
+    Key="gold/eficiencia_hardware.csv",
+    Body=eficiencia.to_csv(index=False),
+    ContentType="text/csv"
 )
 
 
-salvar_gold(
-    eficiencia,
-    "eficiencia_hardware.csv"
-)
+# ============================================================
+# FINAL
+# ============================================================
 
-
-# ==================================================
-# 4. ANÁLISE DE SEGURANÇA
-# ==================================================
-
-df_firewall["hora"] = (
-    df_firewall["timestamp"]
-    .dt.floor("h")
-)
-
-
-seguranca = (
-    df_firewall
-    .groupby("hora")
-    .agg(
-
-        pacotes_bloqueados=(
-            "Dropped_packets",
-            "sum"
-        ),
-
-        media_cpu=(
-            "CPU_Usage",
-            "mean"
-        ),
-
-        sessoes_ativas=(
-            "Active_sessions",
-            "mean"
-        )
-    )
-    .reset_index()
-)
-
-
-quantidade_medicoes = (
-    df_firewall
-    .groupby("hora")
-    .size()
-    .values
-)
-
-
-seguranca[
-    "media_bloqueios_por_minuto"
-] = (
-    seguranca["pacotes_bloqueados"]
-    /
-    quantidade_medicoes
-)
-
-
-salvar_gold(
-    seguranca,
-    "analise_seguranca.csv"
-)
-
-
-# ==================================================
-# 5. MAPA DE TRÁFEGO
-# ==================================================
-
-trafego_pa = (
-    df_pa[
-        [
-            "timestamp",
-            "ID_antena",
-            "throughput_sent_mbps"
-        ]
-    ]
-    .rename(
-        columns={
-            "throughput_sent_mbps":
-                "trafego_antena_mbps"
-        }
-    )
-)
-
-
-trafego_firewall = (
-    df_firewall[
-        [
-            "timestamp",
-            "throughput_sent_mbps"
-        ]
-    ]
-    .rename(
-        columns={
-            "throughput_sent_mbps":
-                "trafego_firewall_mbps"
-        }
-    )
-)
-
-
-mapa = trafego_pa.merge(
-    trafego_firewall,
-    on="timestamp",
-    how="inner"
-)
-
-
-mapa["percentual_do_firewall"] = (
-    mapa["trafego_antena_mbps"]
-    /
-    mapa["trafego_firewall_mbps"].replace(
-        0,
-        np.nan
-    )
-) * 100
-
-
-salvar_gold(
-    mapa,
-    "mapa_trafego.csv"
-)
-
-
-# ==================================================
-# 6. GARGALO DE SAÍDA
-# ==================================================
-
-gargalo = (
-    df_firewall[
-        [
-            "timestamp",
-            "CPU_Usage",
-            "latency_ms",
-            "Active_sessions"
-        ]
-    ]
-    .copy()
-)
-
-
-correlacao = (
-    df_firewall[
-        [
-            "CPU_Usage",
-            "latency_ms"
-        ]
-    ]
-    .corr()
-    .iloc[0, 1]
-)
-
-
-gargalo[
-    "correlacao_cpu_latencia"
-] = correlacao
-
-
-gargalo["possivel_gargalo"] = (
-    (gargalo["CPU_Usage"] > 80)
-    &
-    (gargalo["latency_ms"] > 100)
-)
-
-
-salvar_gold(
-    gargalo,
-    "gargalo_saida.csv"
-)
-
-
-print(
-    "\nProcesso Silver -> Gold finalizado!"
-)
+print("ETL Silver -> Gold concluído!")
+print()
+print("Relatórios gerados:")
+print(" - gold/zonas_mortas.csv")
+print(" - gold/previsao_sobrecarga.csv")
+print(" - gold/eficiencia_hardware.csv")
