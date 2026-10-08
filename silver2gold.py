@@ -6,11 +6,6 @@ BUCKET_NAME = "bucket-itops"
 
 s3 = boto3.client("s3")
 
-
-# ============================================================
-# 1. LER SILVER
-# ============================================================
-
 obj = s3.get_object(
     Bucket=BUCKET_NAME,
     Key="silver/dados_consolidados.csv"
@@ -20,13 +15,7 @@ dados = pd.read_csv(BytesIO(obj["Body"].read()))
 
 dados["timestamp"] = pd.to_datetime(dados["timestamp"])
 
-# Apenas Access Points
 aps = dados[dados["tipo"] == "PA"].copy()
-
-
-# ============================================================
-# 2. RELATÓRIO DE ZONAS MORTAS / SUBUTILIZADAS
-# ============================================================
 
 zonas_mortas = (
     aps.groupby("ID_antena")
@@ -39,12 +28,10 @@ zonas_mortas = (
     .reset_index()
 )
 
-# Ordena as antenas da menor para a maior utilização
 zonas_mortas = zonas_mortas.sort_values(
     "trafego_medio_mbps"
 )
 
-# Classifica as antenas com menor tráfego
 limite = zonas_mortas["trafego_medio_mbps"].quantile(0.25)
 
 zonas_mortas["classificacao"] = zonas_mortas[
@@ -60,12 +47,6 @@ s3.put_object(
     ContentType="text/csv"
 )
 
-
-# ============================================================
-# 3. RELATÓRIO DE PREDIÇÃO DE SOBRECARGA
-# ============================================================
-
-# Considera somente as últimas 5 horas disponíveis
 hora_final = aps["timestamp"].max()
 hora_inicial = hora_final - pd.Timedelta(hours=5)
 
@@ -136,11 +117,6 @@ s3.put_object(
     ContentType="text/csv"
 )
 
-
-# ============================================================
-# 4. RELATÓRIO DE EFICIÊNCIA DE HARDWARE
-# ============================================================
-
 eficiencia = (
     aps.groupby("ID_antena")
     .agg(
@@ -150,13 +126,11 @@ eficiencia = (
     .reset_index()
 )
 
-# Evita divisão por zero
 eficiencia["eficiencia_trafego_cpu"] = (
     eficiencia["trafego_medio_mbps"]
     / eficiencia["cpu_media"].replace(0, pd.NA)
 )
 
-# Maior eficiência primeiro
 eficiencia = eficiencia.sort_values(
     "eficiencia_trafego_cpu",
     ascending=False
@@ -169,10 +143,6 @@ s3.put_object(
     ContentType="text/csv"
 )
 
-
-# ============================================================
-# FINAL
-# ============================================================
 
 print("ETL Silver -> Gold concluído!")
 print()
