@@ -10,11 +10,6 @@ CAMINHO_SILVER = "silver/dados_consolidados.csv"
 
 s3 = boto3.client("s3")
 
-
-# ==========================================================
-# LER ARQUIVOS DA BRONZE
-# ==========================================================
-
 def listar_arquivos_bronze():
 
     resposta = s3.list_objects_v2(
@@ -35,11 +30,6 @@ def listar_arquivos_bronze():
 
     return arquivos
 
-
-# ==========================================================
-# LER JSON
-# ==========================================================
-
 def ler_json(chave):
 
     resposta = s3.get_object(
@@ -50,11 +40,6 @@ def ler_json(chave):
     conteudo = resposta["Body"].read()
 
     return json.loads(conteudo)
-
-
-# ==========================================================
-# COLETAR DADOS
-# ==========================================================
 
 arquivos = listar_arquivos_bronze()
 
@@ -68,10 +53,6 @@ for arquivo in arquivos:
 
     timestamp = dados.get("timestamp")
 
-
-    # ------------------------------------------
-    # PONTO DE ACESSO
-    # ------------------------------------------
 
     if "access_points" in dados:
 
@@ -93,11 +74,6 @@ for arquivo in arquivos:
             }
 
             dados_pa.append(registro)
-
-
-    # ------------------------------------------
-    # FIREWALL
-    # ------------------------------------------
 
     elif "firewall" in dados:
 
@@ -125,19 +101,9 @@ for arquivo in arquivos:
 
         dados_firewall.append(registro)
 
-
-# ==========================================================
-# DATAFRAMES
-# ==========================================================
-
 df_pa = pd.DataFrame(dados_pa)
 
 df_firewall = pd.DataFrame(dados_firewall)
-
-
-# ==========================================================
-# CONSOLIDAR
-# ==========================================================
 
 df_novo = pd.concat(
     [df_pa, df_firewall],
@@ -150,11 +116,6 @@ if df_novo.empty:
     print("Nenhum dado encontrado na Bronze.")
 
     exit()
-
-
-# ==========================================================
-# LER SILVER EXISTENTE
-# ==========================================================
 
 try:
 
@@ -171,20 +132,10 @@ except s3.exceptions.NoSuchKey:
 
     df_antigo = pd.DataFrame()
 
-
-# ==========================================================
-# JUNTAR HISTÓRICO + NOVOS DADOS
-# ==========================================================
-
 df = pd.concat(
     [df_antigo, df_novo],
     ignore_index=True
 )
-
-
-# ==========================================================
-# REMOVER DUPLICADOS
-# ==========================================================
 
 colunas_id = [
     "timestamp",
@@ -198,10 +149,6 @@ df = df.drop_duplicates(
 )
 
 
-# ==========================================================
-# ORGANIZAR TIMESTAMP
-# ==========================================================
-
 df["timestamp"] = pd.to_datetime(
     df["timestamp"]
 )
@@ -210,10 +157,6 @@ df = df.sort_values(
     ["tipo", "ID_antena", "timestamp"]
 )
 
-
-# ==========================================================
-# THROUGHPUT
-# ==========================================================
 
 df["Bytes_Sent_anterior"] = (
     df.groupby(
@@ -247,10 +190,6 @@ df["throughput_recv_mbps"] = (
 )
 
 
-# ==========================================================
-# STATUS DA CARGA
-# ==========================================================
-
 def verificar_status(linha):
 
     if (
@@ -273,11 +212,6 @@ df["status_carga"] = df.apply(
     verificar_status,
     axis=1
 )
-
-
-# ==========================================================
-# CONSISTÊNCIA DO TRÁFEGO
-# ==========================================================
 
 df_pa_consistencia = (
     df[df["tipo"] == "PA"]
@@ -326,11 +260,6 @@ df = pd.merge(
     how="left"
 )
 
-
-# ==========================================================
-# LIMPEZA
-# ==========================================================
-
 df = df.drop(
     columns=[
         "Bytes_Sent_anterior",
@@ -342,11 +271,6 @@ df = df.drop(
 df["timestamp"] = df["timestamp"].dt.strftime(
     "%Y-%m-%d %H:%M:%S"
 )
-
-
-# ==========================================================
-# SALVAR SILVER
-# ==========================================================
 
 csv = df.to_csv(
     index=False
